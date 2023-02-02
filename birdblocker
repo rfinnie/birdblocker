@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+
+# birdblocker
+# Copyright (C) 2023 Ryan Finnie
+# SPDX-License-Identifier: MPL-2.0
+
+import argparse
+import atexit
+import datetime
+import json
+import logging
+import os
+import pathlib
+import random
+import signal
+import sys
+import time
+
+import requests
+import requests_oauthlib
+import yaml
+
+
+class BirdBlocker:
+    args = None
+    config = None
+    requests_session = None
+    my_user = None
+    sleep_time = None
+    disk_cache = None
+    pagination_max_results = 100
+    api_base = "https://api.twitter.com/2"
+
+    def __init__(self):
+        self.disk_cache = {}
+
+    def write_disk_cache(self, force=False):
+        for id in self.disk_cache:
+            if not self.disk_cache[id]["items"]:
+                continue
+
+            if (not force) and (
+                datetime.datetime.now()
+                < (
+                    self.disk_cache[id]["last_written"]
+                    + datetime.timedelta(minutes=self.args.cache_minutes)
+                )
+            ):
+                continue
+
+            fn = "{}-{}.json".format(
+                self.disk_cache[id]["base_fn"],
+                datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f"),
+            )
+            logging.debug(
+                "Writing {} with {} entries".format(
+                    fn, len(self.disk_cache[id]["items"])
+                )
+            )
+            with self.args.data_dir.joinpath(fn).open("w") as f:
+                json.dump(self.disk_cache[id]["items"], f, indent=4, sort_keys=True)
+            self.disk_cache[id]["items"] = []
+            self.disk_cache[id]["last_written"] = datetime.datetime.now()
+
+    def exit_handler(self, signum, frame):
+        self.write_disk_cache(force=True)
+        if signum is not None:
+            sys.exit(0)
+
+    def load_config(self):
+        with self.args.config.open() as f:
+            return yaml.safe_load(f)
+
+    def parse_args(self, argv=None):
+        if argv is None:
+            argv = sys.argv
+
+        parser = argparse.ArgumentParser(
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+            prog=os.path.basename(argv[0]),
+        )
+
+        def _get_default_config():
+            for dir in (".", os.path.join(os.path.dirname(os.path.realpath(__file__)))):
+                fn = pathlib.Path(dir).joinpath("config.yaml")
+                if fn.exists():
+                    return str(fn)
+            return "config.yaml"
+
+        parser.add_argument(
+            "--debug", action="store_true", help="Print debugging information"
+        )
+        parser.add_argument(
+            "--config",
+            type=pathlib.Path,
+            default=_get_default_config(),
+            help="Configuration file",
+        )
+        parser.add_argument(
+            "--data-dir",
+            type=pathlib.Path,
+            default=".",
+            help="Directory to read/write data",
+        )
+        parser.add_argument(
+            "--cache-minutes",
+            type=float,
+            default=720,
+            help="Minutes to wait before periodically writing cache to disk",
+        )
+
+        subparsers = parser.add_subparsers(dest="command")
+        subparsers.required = True
+
+        subparsers.add_parser("combine", help="Write combined users file")
+        subparsers.add_parser("block", help="Block users")
+        parser_likes = subparsers.add_parser("likes", help="Get users who like a tweet")
+        parser_retweets = subparsers.add_parser(
+            "retweets", help="Get users who retweet a tweet"
+        )
+        for p in (parser_likes, parser_retweets):
+            p.add_argument("url", nargs="+", help="Tweet URL")
+            p.add_argument(
+                "--priority",
+                type=int,
+                default="500",
+                help="Block priority (higher is first)",
+            )
+            p.add_argument(
+                "--pagination-token",
+                help="Pagination token to resume from",
+            )
+
+        return parser.parse_args(args=argv[1:])
+
+    def load_users(self):
+        already_processed_ids = set()
+        for fn in self.args.data_dir.glob("processed-*.json"):
+            with fn.open() as f:
+                for p in json.load(f):
+                    if p["status_code"] in (200, 400):
+                        already_processed_ids.add(p["user"]["id"])
+        logging.debug("{} already processed".format(len(already_processed_ids)))
+
+        users = []
+        for fn in self.args.data_dir.glob("users-*.json"):
+            with fn.open() as f:
+                users.extend(json.load(f))
+        logging.debug("{} raw users loaded".format(len(users)))
+
+        # Sort once first so the deduplication will prefer based on priority
+        users.sort(key=lambda x: x["priority"], reverse=True)
+        # Deduplicate based on ID
+        users = list(
+            {
+                user["id"]: user
+                for user in users
+                if user["id"] not in already_processed_ids
+            }.values()
+        )
+        # Shuffle, then sort, so the users are shuffled within priority groups
+        random.shuffle(users)
+        users.sort(key=lambda x: x["priority"], reverse=True)
+
+        return users
+
+    def get_my_user(self):
+        r = self.requests_session.get("{}/users/me".format(self.api_base))
+        r.raise_for_status()
+        j = r.json()
+        logging.debug("I am: {}".format(j["data"]))
+        return j["data"]
+
+    def process_rate_limit(self, r):
+        api_limit = float(r.headers.get("x-rate-limit-limit"))
+        api_remaining = float(r.headers.get("x-rate-limit-remaining"))
+        api_reset = datetime.datetime.fromtimestamp(
+            float(r.headers.get("x-rate-limit-reset"))
+        )
+        logging.debug(
+            "Rate limit: {}/{} remaining until {}".format(
+                api_remaining, api_limit, api_reset
+            )
+        )
+
+        if api_remaining <= 1:
+            self.sleep_time = (
+                api_reset - datetime.datetime.now() + datetime.timedelta(seconds=1)
+            )
+        else:
+            self.sleep_time = (api_reset - datetime.datetime.now()) / (
+                api_remaining - 1
+            )
+        if self.sleep_time < datetime.timedelta(seconds=1):
+            self.sleep_time = datetime.timedelta(seconds=1)
+
+    def block_user(self, user):
+        logging.info("")
+        logging.info(
+            "Blocking {} (https://twitter.com/{}), priority {}".format(
+                user["name"],
+                user["username"],
+                user["priority"],
+            )
+        )
+        try:
+            r = self.requests_session.post(
+                "{}/users/{}/blocking".format(self.api_base, self.my_user["id"]),
+                json={"target_user_id": user["id"]},
+            )
+            r.raise_for_status()
+        except Exception as e:
+            try:
+                e.args = e.args + (r.json(),)
+            except Exception:
+                pass
+            logging.exception("Request exception")
+
+        self.disk_cache["blocked"]["items"].append(
+            {
+                "status_code": r.status_code,
+                "user": user,
+            }
+        )
+        self.process_rate_limit(r)
+
+    def block_users(self):
+        users = self.load_users()
+        num_users = len(users)
+        logging.info("{} users to block".format(num_users))
+
+        self.disk_cache["blocked"] = {
+            "base_fn": "processed",
+            "items": [],
+            "last_written": datetime.datetime.now(),
+        }
+
+        for i, user in enumerate(users):
+            self.block_user(user)
+            self.write_disk_cache()
+
+            etl = self.sleep_time * (num_users - (i + 1))
+            logging.info(
+                "Blocked {}/{}, ETL {}".format(
+                    i + 1,
+                    num_users,
+                    etl,
+                )
+            )
+            logging.info("Sleeping {}".format(self.sleep_time))
+            time.sleep(self.sleep_time.total_seconds())
+
+    def get_tweets_users(self):
+        for url in self.args.url:
+            self.get_tweet_users(url.split("/")[-1])
+
+    def get_tweet_users(self, tweet_id):
+        action = self.args.command
+        logging.info("Getting {} of {}".format(action, tweet_id))
+
+        r = self.requests_session.get(
+            "{}/tweets".format(self.api_base),
+            params={"ids": tweet_id, "tweet.fields": "public_metrics"},
+        )
+        r.raise_for_status()
+        j = r.json()
+        expected_items = j["data"][0]["public_metrics"][
+            "retweet_count" if action == "retweets" else "like_count"
+        ]
+
+        self.disk_cache[action] = {
+            "base_fn": "users-{}-{}".format(action, tweet_id),
+            "items": [],
+            "last_written": datetime.datetime.now(),
+        }
+
+        page = 1
+        pagination_token = self.args.pagination_token
+        retrieved = 0
+        while True:
+            params = {"max_results": self.pagination_max_results}
+            if pagination_token is not None:
+                params["pagination_token"] = pagination_token
+            logging.info("")
+            logging.info("Page {}: {}".format(page, pagination_token))
+            while True:
+                try:
+                    r = self.requests_session.get(
+                        "{}/tweets/{}/{}".format(
+                            self.api_base,
+                            tweet_id,
+                            (
+                                "retweeted_by"
+                                if action == "retweets"
+                                else "liking_users"
+                            ),
+                        ),
+                        params=params,
+                    )
+                    r.raise_for_status()
+                    break
+                except Exception:
+                    logging.exception("Received exception")
+                    time.sleep(30)
+            j = r.json()
+            users_page = j.get("data", [])
+            for user in users_page:
+                user["priority"] = self.args.priority
+                self.disk_cache[action]["items"].append(user)
+            retrieved += len(users_page)
+            new_pagination_token = j.get("meta", {}).get("next_token")
+            if new_pagination_token is None:
+                break
+            logging.info("Next pagination token: {}".format(new_pagination_token))
+            pagination_token = new_pagination_token
+
+            self.process_rate_limit(r)
+            self.write_disk_cache()
+
+            # pagination_max_results could be used, but (retrieved / page)
+            # is likely to be more accurate as the number of results
+            # actually returned per page is almost always fewer.
+            etl = self.sleep_time * ((expected_items - retrieved) / (retrieved / page))
+            logging.info(
+                "Retrieved {}/~{}, ETL {}".format(retrieved, expected_items, etl)
+            )
+            logging.info("Sleeping {}".format(self.sleep_time))
+            page = page + 1
+            time.sleep(self.sleep_time.total_seconds())
+
+    def combine_users(self):
+        self.disk_cache["combined"] = {
+            "base_fn": "users-combined",
+            "items": self.load_users(),
+            "last_written": datetime.datetime.now(),
+        }
+
+    def main(self):
+        self.args = self.parse_args()
+        self.config = self.load_config()
+
+        logging.basicConfig(
+            level=(logging.DEBUG if self.args.debug else logging.INFO),
+            format="%(levelname)s: %(message)s",
+        )
+
+        if self.args.command == "combine":
+            return self.combine_users()
+
+        self.requests_session = requests_oauthlib.OAuth1Session(
+            self.config["consumer_key"],
+            client_secret=self.config["consumer_secret"],
+            resource_owner_key=self.config["access_token"],
+            resource_owner_secret=self.config["access_token_secret"],
+        )
+        self.my_user = self.get_my_user()
+
+        if self.args.command == "block":
+            return self.block_users()
+        elif self.args.command in ("likes", "retweets"):
+            return self.get_tweets_users()
+
+
+def make_exit_handler(cls):
+    return lambda signum, frame: cls.exit_handler(signum, frame)
+
+
+if __name__ == "__main__":
+    cls = BirdBlocker()
+    atexit.register(make_exit_handler(cls), None, None)
+    signal.signal(signal.SIGTERM, make_exit_handler(cls))
+    signal.signal(signal.SIGINT, make_exit_handler(cls))
+    sys.exit(cls.main())
