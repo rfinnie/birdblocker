@@ -33,6 +33,11 @@ class BirdBlocker:
     def __init__(self):
         self.disk_cache = {}
 
+    def approximate_td(self, td):
+        if td.days >= 5:
+            return "{} days".format(td.days)
+        return str(td - datetime.timedelta(microseconds=td.microseconds))
+
     def write_disk_cache(self, force=False):
         for id in self.disk_cache:
             if not self.disk_cache[id]["items"]:
@@ -256,7 +261,7 @@ class BirdBlocker:
                 "Blocked {}/{}, ETL {}".format(
                     i + 1,
                     num_users,
-                    self.sleep_time * (num_users - (i + 1)),
+                    self.approximate_td(self.sleep_time * (num_users - (i + 1))),
                 )
             )
 
@@ -267,8 +272,10 @@ class BirdBlocker:
                         priority,
                         priority_i[priority],
                         priority_counts[priority],
-                        self.sleep_time
-                        * (priority_counts[priority] - (priority_i[priority])),
+                        self.approximate_td(
+                            self.sleep_time
+                            * (priority_counts[priority] - (priority_i[priority]))
+                        ),
                         " (this)" if priority == user["priority"] else "",
                     )
                 )
@@ -348,7 +355,9 @@ class BirdBlocker:
             # actually returned per page is almost always fewer.
             etl = self.sleep_time * ((expected_items - retrieved) / (retrieved / page))
             logging.info(
-                "Retrieved {}/~{}, ETL {}".format(retrieved, expected_items, etl)
+                "Retrieved {}/~{}, ETL {}".format(
+                    retrieved, expected_items, self.approximate_td(etl)
+                )
             )
             logging.info("Sleeping {}".format(self.sleep_time))
             page = page + 1
