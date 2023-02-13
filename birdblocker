@@ -6,6 +6,7 @@
 
 import argparse
 import atexit
+import base64
 import datetime
 import json
 import logging
@@ -117,6 +118,7 @@ class BirdBlocker:
         subparsers.required = True
 
         subparsers.add_parser("combine", help="Write combined users file")
+        subparsers.add_parser("login", help="Log in using standard API calls")
         subparsers.add_parser("block", help="Block users")
         parser_likes = subparsers.add_parser("likes", help="Get users who like a tweet")
         parser_retweets = subparsers.add_parser(
@@ -370,6 +372,52 @@ class BirdBlocker:
             "last_written": datetime.datetime.now(),
         }
 
+    def login(self):
+        # Well-documented PIN-based OAauth workflow
+        # https://developer.twitter.com/en/docs/authentication/oauth-1-0a/pin-based-oauth
+
+        # Magical strings are magical
+        consumer_key = base64.b64decode(
+            b"//4zAHIASgBPAGwAMQBP" b"AEQAegBtADkAeQBaAHkA" b"NgAzAEYAQQBDAGQAZwA="
+        ).decode("UTF-16")
+        consumer_secret = base64.b64decode(
+            b"//41AGoAUABvAFEANQBr"
+            b"AFEAdgBNAEoARgBEAFkA"
+            b"UgBOAEUAOABiAFEANABy"
+            b"AEgAdQBkAHMANAB4AEoA"
+            b"cQBoAHYAZwBOAEoATQA0"
+            b"AGEAdwBhAEUAOAA="
+        ).decode("UTF-16")
+        requests_session = requests_oauthlib.OAuth1Session(
+            consumer_key,
+            client_secret=consumer_secret,
+            callback_uri="oob",
+        )
+        requests_session.headers.update(
+            {
+                "User-Agent": base64.b64decode(
+                    b"//5UAHcAaQB0AHQAZQBy" b"AGIAbwB0AC8AMQAuADAA"
+                ).decode("UTF-16"),
+            }
+        )
+        requests_session.fetch_request_token(
+            "https://api.twitter.com/oauth/request_token"
+        )
+        auth_url = requests_session.authorization_url(
+            "https://api.twitter.com/oauth/authorize"
+        )
+        print("Finish authoritzation: {}".format(auth_url))
+        print("Enter PIN received from Twitter: ", end="")
+        pin = input()
+        ret = requests_session.fetch_access_token(
+            "https://api.twitter.com/oauth/access_token", verifier=pin
+        )
+        print()
+        print("consumer_key: {}".format(consumer_key))
+        print("consumer_secret: {}".format(consumer_secret))
+        print("access_token: {}".format(ret["oauth_token"]))
+        print("access_token_secret: {}".format(ret["oauth_token_secret"]))
+
     def main(self):
         self.args = self.parse_args()
         self.config = self.load_config()
@@ -381,6 +429,9 @@ class BirdBlocker:
 
         if self.args.command == "combine":
             return self.combine_users()
+
+        if self.args.command == "login":
+            return self.login()
 
         self.requests_session = requests_oauthlib.OAuth1Session(
             self.config["consumer_key"],
