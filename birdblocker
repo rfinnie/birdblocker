@@ -16,7 +16,6 @@ import signal
 import sys
 import time
 
-import requests
 import requests_oauthlib
 import yaml
 
@@ -166,7 +165,14 @@ class BirdBlocker:
 
     def get_my_user(self):
         r = self.requests_session.get("{}/users/me".format(self.api_base))
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except Exception as e:
+            try:
+                e.args = e.args + (r.json(),)
+            except Exception:
+                pass
+            raise
         j = r.json()
         logging.debug("I am: {}".format(j["data"]))
         return j["data"]
@@ -227,6 +233,13 @@ class BirdBlocker:
     def block_users(self):
         users = self.load_users()
         num_users = len(users)
+        priority_counts = {}
+        priority_i = {}
+        for user in users:
+            if user["priority"] not in priority_counts:
+                priority_counts[user["priority"]] = 0
+                priority_i[user["priority"]] = 0
+            priority_counts[user["priority"]] += 1
         logging.info("{} users to block".format(num_users))
 
         self.disk_cache["blocked"] = {
@@ -239,14 +252,27 @@ class BirdBlocker:
             self.block_user(user)
             self.write_disk_cache()
 
-            etl = self.sleep_time * (num_users - (i + 1))
             logging.info(
                 "Blocked {}/{}, ETL {}".format(
                     i + 1,
                     num_users,
-                    etl,
+                    self.sleep_time * (num_users - (i + 1)),
                 )
             )
+
+            priority_i[user["priority"]] += 1
+            for priority in sorted(priority_counts, reverse=True):
+                logging.info(
+                    "    Priority {}: blocked {}/{}, ETL {}{}".format(
+                        priority,
+                        priority_i[priority],
+                        priority_counts[priority],
+                        self.sleep_time
+                        * (priority_counts[priority] - (priority_i[priority])),
+                        " (this)" if priority == user["priority"] else "",
+                    )
+                )
+
             logging.info("Sleeping {}".format(self.sleep_time))
             time.sleep(self.sleep_time.total_seconds())
 
