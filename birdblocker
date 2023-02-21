@@ -132,6 +132,7 @@ class BirdBlocker:
                 default="500",
                 help="Block priority (higher is first)",
             )
+            p.add_argument("--reason", help="Reason for block")
             p.add_argument(
                 "--pagination-token",
                 help="Pagination token to resume from",
@@ -219,6 +220,8 @@ class BirdBlocker:
                 user["priority"],
             )
         )
+        if user.get("reason"):
+            logging.info("Reason: {}".format(user["reason"]))
         r = None
         try:
             r = self.requests_session.post(
@@ -292,11 +295,12 @@ class BirdBlocker:
 
     def get_tweets_users(self):
         for url in self.args.url:
-            self.get_tweet_users(url.split("/")[-1])
+            self.get_tweet_users(url)
 
-    def get_tweet_users(self, tweet_id):
+    def get_tweet_users(self, tweet_url):
         action = self.args.command
-        logging.info("Getting {} of {}".format(action, tweet_id))
+        tweet_id = tweet_url.split("/")[-1]
+        logging.info("Getting {} of {}".format(action, tweet_url))
 
         r = self.requests_session.get(
             "{}/tweets".format(self.api_base),
@@ -346,6 +350,10 @@ class BirdBlocker:
             users_page = j.get("data", [])
             for user in users_page:
                 user["priority"] = self.args.priority
+                if self.args.reason:
+                    user["reason"] = self.args.reason
+                else:
+                    user["reason"] = "{} {}".format(action, tweet_url)
                 self.disk_cache[action]["items"].append(user)
             retrieved += len(users_page)
             new_pagination_token = j.get("meta", {}).get("next_token")
