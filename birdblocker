@@ -185,6 +185,9 @@ class BirdBlocker:
         return j["data"]
 
     def process_rate_limit(self, r):
+        if r is None:
+            self.sleep_time = datetime.timedelta(seconds=60)
+            return
         api_limit = float(r.headers.get("x-rate-limit-limit"))
         api_remaining = float(r.headers.get("x-rate-limit-remaining"))
         api_reset = datetime.datetime.fromtimestamp(
@@ -216,6 +219,7 @@ class BirdBlocker:
                 user["priority"],
             )
         )
+        r = None
         try:
             r = self.requests_session.post(
                 "{}/users/{}/blocking".format(self.api_base, self.my_user["id"]),
@@ -229,12 +233,13 @@ class BirdBlocker:
                 pass
             logging.exception("Request exception")
 
-        self.disk_cache["blocked"]["items"].append(
-            {
-                "status_code": r.status_code,
-                "user": user,
-            }
-        )
+        if r is not None:
+            self.disk_cache["blocked"]["items"].append(
+                {
+                    "status_code": r.status_code,
+                    "user": user,
+                }
+            )
         self.process_rate_limit(r)
 
     def block_users(self):
