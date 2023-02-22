@@ -17,6 +17,7 @@ import signal
 import sys
 import time
 
+import requests
 import requests_oauthlib
 import yaml
 
@@ -172,18 +173,33 @@ class BirdBlocker:
         return users
 
     def get_my_user(self):
-        r = self.requests_session.get("{}/users/me".format(self.api_base))
-        try:
-            r.raise_for_status()
-        except Exception as e:
-            try:
-                e.args = e.args + (r.json(),)
-            except Exception:
-                pass
-            raise
+        r = self.api_request("GET", "{}/users/me".format(self.api_base))
         j = r.json()
         logging.debug("I am: {}".format(j["data"]))
         return j["data"]
+
+    def api_request(self, *args, **kwargs):
+        while True:
+            r = self.requests_session.request(*args, **kwargs)
+            if r.status_code == 429:
+                api_reset = datetime.datetime.fromtimestamp(
+                    float(r.headers.get("x-rate-limit-reset"))
+                )
+                api_sleep = (api_reset - datetime.datetime.now()) + datetime.timedelta(
+                    seconds=1
+                )
+                logging.info("Rate limit reached, trying again in {}".format(api_sleep))
+                time.sleep(api_sleep.total_seconds())
+                continue
+            try:
+                r.raise_for_status()
+            except requests.HTTPError as e:
+                try:
+                    e.args = e.args + (r.json(),)
+                except Exception:
+                    pass
+                raise
+            return r
 
     def process_rate_limit(self, r):
         if r is None:
@@ -201,13 +217,9 @@ class BirdBlocker:
         )
 
         if api_remaining <= 1:
-            self.sleep_time = (
-                api_reset - datetime.datetime.now() + datetime.timedelta(seconds=1)
-            )
+            self.sleep_time = api_reset - datetime.datetime.now()
         else:
-            self.sleep_time = (api_reset - datetime.datetime.now()) / (
-                api_remaining - 1
-            )
+            self.sleep_time = (api_reset - datetime.datetime.now()) / api_remaining
         if self.sleep_time < datetime.timedelta(seconds=1):
             self.sleep_time = datetime.timedelta(seconds=1)
 
@@ -224,16 +236,12 @@ class BirdBlocker:
             logging.info("Reason: {}".format(user["reason"]))
         r = None
         try:
-            r = self.requests_session.post(
+            r = self.api_request(
+                "POST",
                 "{}/users/{}/blocking".format(self.api_base, self.my_user["id"]),
                 json={"target_user_id": user["id"]},
             )
-            r.raise_for_status()
-        except Exception as e:
-            try:
-                e.args = e.args + (r.json(),)
-            except Exception:
-                pass
+        except Exception:
             logging.exception("Request exception")
 
         if r is not None:
@@ -302,11 +310,11 @@ class BirdBlocker:
         tweet_id = tweet_url.split("/")[-1]
         logging.info("Getting {} of {}".format(action, tweet_url))
 
-        r = self.requests_session.get(
+        r = self.api_request(
+            "GET",
             "{}/tweets".format(self.api_base),
             params={"ids": tweet_id, "tweet.fields": "public_metrics"},
         )
-        r.raise_for_status()
         j = r.json()
         expected_items = j["data"][0]["public_metrics"][
             "retweet_count" if action == "retweets" else "like_count"
@@ -329,7 +337,8 @@ class BirdBlocker:
             logging.info("Page {}: {}".format(page, pagination_token))
             while True:
                 try:
-                    r = self.requests_session.get(
+                    r = self.api_request(
+                        "GET",
                         "{}/tweets/{}/{}".format(
                             self.api_base,
                             tweet_id,
@@ -341,7 +350,6 @@ class BirdBlocker:
                         ),
                         params=params,
                     )
-                    r.raise_for_status()
                     break
                 except Exception:
                     logging.exception("Received exception")
