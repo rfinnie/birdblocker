@@ -33,6 +33,19 @@ class BirdBlocker:
     pagination_max_results = 100
     api_base = "https://api.twitter.com/2"
 
+    search_words = (
+        "a about all an and are as at be been but by call can "
+        "come could day did do down each find first for from "
+        "get go had has have he her him his how i if in into "
+        "is it its like long look made make many may more my "
+        "no not now number of oil on one or other out part "
+        "people said see she so some than that the their "
+        "them then there these they this time to two up use "
+        "was water way we were what when which who will with "
+        "word would write you your "
+        "crypto musk twitter"
+    ).split(" ")
+
     def __init__(self):
         self.disk_cache = {}
 
@@ -123,12 +136,14 @@ class BirdBlocker:
         subparsers.add_parser("login", help="Log in using standard API calls")
         subparsers.add_parser("block", help="Block users")
         subparsers.add_parser("whoami", help="Initial user information")
+        parser_blue = subparsers.add_parser("blue", help="Get Twitter Blue users")
         parser_likes = subparsers.add_parser("likes", help="Get users who like a tweet")
         parser_retweets = subparsers.add_parser(
             "retweets", help="Get users who retweet a tweet"
         )
         for p in (parser_likes, parser_retweets):
             p.add_argument("url", nargs="+", help="Tweet URL")
+        for p in (parser_likes, parser_retweets, parser_blue):
             p.add_argument(
                 "--priority",
                 type=int,
@@ -393,6 +408,73 @@ class BirdBlocker:
             page = page + 1
             time.sleep(self.sleep_time.total_seconds())
 
+    def get_blue_users(self):
+        query = random.choice(self.search_words)
+        logging.info("Getting Twitter Blue users via search for '{}'".format(query))
+
+        action = "blue"
+        self.disk_cache[action] = {
+            "base_fn": "users-{}".format(action),
+            "items": [],
+            "last_written": datetime.datetime.now(),
+        }
+
+        page = 1
+        pagination_token = self.args.pagination_token
+        retrieved = 0
+        raw_retrieved = 0
+        while True:
+            params = {
+                "query": "{} is:verified".format(query),
+                "expansions": "author_id",
+                "user.fields": "verified_type",
+                "max_results": self.pagination_max_results,
+            }
+            if pagination_token is not None:
+                params["pagination_token"] = pagination_token
+            logging.info("")
+            logging.info("Page {}: {}".format(page, pagination_token))
+            while True:
+                try:
+                    r = self.api_request(
+                        "GET",
+                        "{}/tweets/search/recent".format(self.api_base),
+                        params=params,
+                    )
+                    self.api_raise(r)
+                    break
+                except Exception:
+                    logging.exception("Received exception")
+                    time.sleep(30)
+            j = r.json()
+            raw_retrieved += len(j["includes"]["users"])
+            users_page = [
+                user
+                for user in j["includes"]["users"]
+                if user["verified_type"] == "blue"
+            ]
+            for user in users_page:
+                del user["verified_type"]
+                user["priority"] = self.args.priority
+                if self.args.reason:
+                    user["reason"] = self.args.reason
+                else:
+                    user["reason"] = "Twitter Blue ({})".format(query)
+                self.disk_cache[action]["items"].append(user)
+            retrieved += len(users_page)
+            new_pagination_token = j.get("meta", {}).get("next_token")
+            if new_pagination_token is None:
+                break
+            logging.info("Next pagination token: {}".format(new_pagination_token))
+            pagination_token = new_pagination_token
+
+            self.write_disk_cache()
+
+            logging.info("Retrieved {}/{}".format(retrieved, raw_retrieved))
+            logging.info("Sleeping {}".format(self.sleep_time))
+            page = page + 1
+            time.sleep(self.sleep_time.total_seconds())
+
     def combine_users(self):
         self.disk_cache["combined"] = {
             "base_fn": "users-combined",
@@ -476,6 +558,8 @@ class BirdBlocker:
 
         if self.args.command == "block":
             return self.block_users()
+        elif self.args.command == "blue":
+            return self.get_blue_users()
         elif self.args.command in ("likes", "retweets"):
             return self.get_tweets_users()
 
